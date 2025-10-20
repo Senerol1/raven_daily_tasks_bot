@@ -8,11 +8,11 @@ from typing import List, Optional
 
 import pytz
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    JobQueue,   # ВАЖНО: используем JobQueue с таймзоной
 )
 
 # ----------------------------
@@ -36,7 +36,6 @@ def load_config() -> dict:
             cfg = json.load(f)
     except Exception:
         cfg = {}
-    # заполнить пропущенные поля дефолтами
     merged = DEFAULT_CFG.copy()
     merged.update(cfg or {})
     return merged
@@ -46,7 +45,6 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 def get_tzinfo():
-    # TIMEZONE берём из переменных окружения Render (например, Europe/Moscow)
     tz = os.getenv("TIMEZONE", "Europe/Moscow")
     try:
         return pytz.timezone(tz)
@@ -79,8 +77,7 @@ async def send_poll_to(
 
     today = datetime.now(get_tzinfo()).strftime("%Y-%m-%d")
     question = f"{title_prefix + ' - ' if title_prefix else ''}Задачи на {today}"
-    # Telegram ограничивает количество вариантов (макс 10). Отрежем лишнее, если что.
-    options = tasks[:10]
+    options = tasks[:10]  # максимум 10 вариантов у Poll
 
     await context.bot.send_poll(
         chat_id=chat_id,
@@ -99,7 +96,6 @@ async def send_tasks(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
     tasks = cfg.get("tasks", [])
 
     if not chat_id:
-        # Некуда слать — молча выходим (или можно писать в логи)
         print("[send_tasks] target_chat_id not set; skip", flush=True)
         return
 
@@ -115,7 +111,7 @@ async def send_tasks(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
         print(f"[send_tasks] error: {e!r}", flush=True)
 
 # ----------------------------
-# Команды (личка и/или группа)
+# Команды
 # ----------------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -130,16 +126,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды для группы/ветки:\n"
         "/bind — привязать этот чат/ветку как место ежедневной отправки\n"
         "/settime HH:MM — настроить ежедневное время (по TIMEZONE)\n"
-        "/postnow — отправить опрос сейчас в привязанный чат/ветку\n"
+        "/postnow — отправить опрос сейчас в привязанную ветку\n"
         "/whereami — показать chat_id и thread_id текущего чата"
     )
     await update.effective_chat.send_message(text)
 
 async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
-    tid = None
-    if update.effective_message:
-        tid = update.effective_message.message_thread_id
+    tid = update.effective_message.message_thread_id if update.effective_message else None
     await update.effective_chat.send_message(f"chat_id = {cid}\nthread_id = {tid}")
 
 async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,12 +145,8 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg["target_thread_id"] = tid
     save_config(cfg)
 
-    # Перепланировать ежедневную отправку
     reschedule_jobs(context.application)
-
-    await update.effective_chat.send_message(
-        f"Привязано!\nchat_id = {cid}\nthread_id = {tid}"
-    )
+    await update.effective_chat.send_message(f"Привязано!\nchat_id = {cid}\nthread_id = {tid}")
 
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -176,7 +166,6 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_config(cfg)
 
     reschedule_jobs(context.application)
-
     await update.effective_chat.send_message(f"Ок! Теперь отправляю ежедневно в {cfg['send_time']}.")
 
 async def addtask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,36 +173,30 @@ async def addtask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.effective_chat.send_message("Использование: /addtask <текст задачи>")
         return
-
     cfg = load_config()
     tasks = cfg.get("tasks", [])
     tasks.append(text)
     cfg["tasks"] = tasks
     save_config(cfg)
-
     await update.effective_chat.send_message(f"Добавил задачу:\n• {text}")
 
 async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.effective_chat.send_message("Использование: /deltask <номер>")
         return
-
     try:
         idx = int(context.args[0]) - 1
     except Exception:
         await update.effective_chat.send_message("Номер должен быть числом. Пример: /deltask 2")
         return
-
     cfg = load_config()
     tasks = cfg.get("tasks", [])
     if not (0 <= idx < len(tasks)):
         await update.effective_chat.send_message("Нет такой задачи. Посмотри /listtasks")
         return
-
     removed = tasks.pop(idx)
     cfg["tasks"] = tasks
     save_config(cfg)
-
     await update.effective_chat.send_message(f"Удалил:\n• {removed}")
 
 async def cleartasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,15 +209,12 @@ async def listtasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cfg = load_config()
         tasks = cfg.get("tasks", [])
-        chat_id = update.effective_chat.id
-
         if not tasks:
-            await context.bot.send_message(chat_id=chat_id, text="Список задач пуст. Добавьте: /addtask <текст>")
+            await update.effective_chat.send_message("Список задач пуст. Добавьте: /addtask <текст>")
             return
-
-        await context.bot.send_message(chat_id=chat_id, text="Текущие задачи:\n" + format_tasks(tasks))
+        await update.effective_chat.send_message("Текущие задачи:\n" + format_tasks(tasks))
     except Exception as e:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ошибка /listtasks: {e!r}")
+        await update.effective_chat.send_message(f"Ошибка /listtasks: {e!r}")
         print(f"/listtasks error: {e!r}", flush=True)
 
 async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,16 +235,16 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------
 # Планирование
 # ----------------------------
-def reschedule_jobs(app, *, first_run: bool = False):
+def reschedule_jobs(app: Application, *, first_run: bool = False):
     """
-    Перепланировать ежедневную отправку без re-configure() уже запущенного APScheduler.
-    Таймзона задана один раз через Application.builder().timezone(...)
+    Перепланировать ежедневную отправку.
+    Таймзона задана в JobQueue при создании приложения.
     """
-    from telegram.ext import ContextTypes  # локальный импорт, чтобы не таскать сверху
+    from telegram.ext import ContextTypes
 
     cfg = load_config()
 
-    # Сносим старую задачу с таким именем
+    # Удалим старую задачу, если есть
     try:
         for job in list(app.job_queue.jobs()):
             if job.name == "daily_tasks":
@@ -279,7 +259,8 @@ def reschedule_jobs(app, *, first_run: bool = False):
         return
 
     hh, mm = map(int, send_time_str.split(":"))
-    send_time = dt_time(hour=hh, minute=mm)  # tz привяжется к Application.timezone
+    # ВАЖНО: time без tzinfo — JobQueue сам применит свою таймзону
+    send_time = dt_time(hour=hh, minute=mm)
 
     async def _job_callback(context: ContextTypes.DEFAULT_TYPE):
         await send_tasks(context, force=True)
@@ -298,10 +279,10 @@ def reschedule_jobs(app, *, first_run: bool = False):
                 await send_tasks(context, force=True)
             except Exception as e:
                 print(f"[reschedule_jobs] first_run send error: {e!r}", flush=True)
-
         app.job_queue.run_once(_once, when=1, name="daily_tasks_first_run")
 
-    print("[reschedule_jobs] scheduled daily_tasks at", send_time_str, "for chat", chat_id, "thread", cfg.get("target_thread_id"), flush=True)
+    print("[reschedule_jobs] scheduled daily_tasks at", send_time_str,
+          "for chat", chat_id, "thread", cfg.get("target_thread_id"), flush=True)
 
 # ----------------------------
 # Ошибки
@@ -324,11 +305,13 @@ async def main():
         raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
     tzinfo = get_tzinfo()
+    # Создаём JobQueue с нужной таймзоной и отдаём билдеру
+    jq = JobQueue(timezone=tzinfo)
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .timezone(tzinfo)            # задаём TZ один раз
+        .job_queue(jq)      # <-- вместо .timezone(...)
         .concurrent_updates(True)
         .build()
     )
@@ -336,21 +319,18 @@ async def main():
     # Команды
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("whereami", whereami_cmd))
-
     application.add_handler(CommandHandler("bind", bind_cmd))
     application.add_handler(CommandHandler("settime", settime_cmd))
     application.add_handler(CommandHandler("postnow", postnow_cmd))
     application.add_handler(CommandHandler("preview", preview_cmd))
-
     application.add_handler(CommandHandler("addtask", addtask_cmd))
     application.add_handler(CommandHandler("deltask", deltask_cmd))
     application.add_handler(CommandHandler("cleartasks", cleartasks_cmd))
     application.add_handler(CommandHandler("listtasks", listtasks_cmd))
     application.add_handler(CommandHandler("tasks", listtasks_cmd))  # алиас
-
     application.add_error_handler(error_handler)
 
-    # Запланируем ежедневную отправку исходя из текущего конфига
+    # Запланируем
     reschedule_jobs(application, first_run=False)
 
     print("Starting polling ...", flush=True)
