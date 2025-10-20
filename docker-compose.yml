@@ -1,0 +1,10 @@
+
+services:
+  tg-daily-tasks-bot:
+    build: .
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - BOT_TZ=Asia/Nicosia
+    volumes:
+      - ./data:/app
+    restart: unless-stopped
