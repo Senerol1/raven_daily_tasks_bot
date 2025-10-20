@@ -1,7 +1,6 @@
 # main.py
 import os
 import json
-import asyncio
 import logging
 from datetime import datetime, time as dt_time
 from typing import List, Optional
@@ -13,7 +12,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    Defaults,       # <-- здесь зададим tzinfo
+    Defaults,
 )
 
 # ----------------------------
@@ -25,7 +24,7 @@ DEFAULT_CFG = {
     "tasks": [],                 # список задач (строки)
     "target_chat_id": None,      # куда слать ежедневно (chat_id)
     "target_thread_id": None,    # в какую ветку (message_thread_id)
-    "send_time": "09:00",        # время ежедневной отправки (HH:MM) в заданной tz
+    "send_time": "09:00",        # время ежедневной отправки (HH:MM) в заданной TZ
     "post_on_start": False       # отправлять ли один раз при старте
 }
 
@@ -67,7 +66,7 @@ async def send_poll_to(
     thread_id: Optional[int] = None,
     title_prefix: Optional[str] = None
 ):
-    """Отправить опрос (Poll) с чекбоксами."""
+    """Отправить опрос (Poll) с чекбоксами (до 10 пунктов)."""
     if not tasks:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -78,7 +77,7 @@ async def send_poll_to(
 
     today = datetime.now(get_tzinfo()).strftime("%Y-%m-%d")
     question = f"{title_prefix + ' - ' if title_prefix else ''}Задачи на {today}"
-    options = tasks[:10]  # максимум 10 вариантов у Poll
+    options = tasks[:10]
 
     await context.bot.send_poll(
         chat_id=chat_id,
@@ -239,7 +238,7 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def reschedule_jobs(app: Application, *, first_run: bool = False):
     """
     Перепланировать ежедневную отправку.
-    Таймзона берётся из Application.defaults.tzinfo.
+    Таймзона берётся из Application.defaults.tzinfo (через Defaults).
     """
     cfg = load_config()
 
@@ -258,8 +257,7 @@ def reschedule_jobs(app: Application, *, first_run: bool = False):
         return
 
     hh, mm = map(int, send_time_str.split(":"))
-    # ВАЖНО: time без tzinfo — JobQueue применит tz из Defaults(tzinfo=...)
-    send_time = dt_time(hour=hh, minute=mm)
+    send_time = dt_time(hour=hh, minute=mm)  # tz применит Defaults(tzinfo=...)
 
     async def _job_callback(context: ContextTypes.DEFAULT_TYPE):
         await send_tasks(context, force=True)
@@ -295,16 +293,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 # ----------------------------
-# MAIN
+# ENTRYPOINT (без asyncio.run!)
 # ----------------------------
-async def main():
+if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     if not BOT_TOKEN:
         raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
     tzinfo = get_tzinfo()
-    defaults = Defaults(tzinfo=tzinfo)  # <-- так задаём таймзону для JobQueue
+    defaults = Defaults(tzinfo=tzinfo)
 
     application: Application = (
         ApplicationBuilder()
@@ -314,7 +313,7 @@ async def main():
         .build()
     )
 
-    # Команды
+    # Хэндлеры
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("bind", bind_cmd))
@@ -328,15 +327,12 @@ async def main():
     application.add_handler(CommandHandler("tasks", listtasks_cmd))  # алиас
     application.add_error_handler(error_handler)
 
-    # Планирование
+    # Планирование (ежедневная отправка)
     reschedule_jobs(application, first_run=False)
 
     print("Starting polling ...", flush=True)
-    await application.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
         stop_signals=None,
     )
-
-if __name__ == "__main__":
-    asyncio.run(main())
