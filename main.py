@@ -1,12 +1,12 @@
-import asyncio
-import json
 import os
+import json
 from datetime import datetime, time
 from dateutil import tz
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# === Конфигурация и значения по умолчанию ===
 CONFIG_PATH = "config.json"
 DEFAULT_TEMPLATE = (
     "Список задач на {date} ({weekday}):\n"
@@ -17,6 +17,7 @@ DEFAULT_TEMPLATE = (
 DEFAULT_TZ = os.getenv("BOT_TZ", "Asia/Nicosia")
 
 
+# === Работа с конфигом ===
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         return {
@@ -36,6 +37,28 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+# === Вспомогательные ===
+def parse_hhmm(s: str) -> time:
+    hh, mm = s.strip().split(":")
+    return time(hour=int(hh), minute=int(mm))
+
+
+def require_owner(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        cfg = load_config()
+        owner = cfg.get("owner_id")
+        user_id = update.effective_user.id if update.effective_user else None
+        if owner is None and user_id:
+            cfg["owner_id"] = user_id
+            save_config(cfg)
+        elif owner is not None and owner != user_id:
+            await update.message.reply_text("Только владелец бота может это делать.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# === Джоб: отправка задач ===
 async def send_tasks(context: ContextTypes.DEFAULT_TYPE):
     cfg = load_config()
     chat_id = cfg.get("chat_id")
@@ -64,31 +87,12 @@ async def send_tasks(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def parse_hhmm(s: str) -> time:
-    hh, mm = s.strip().split(":")
-    return time(hour=int(hh), minute=int(mm))
-
-
+# === Команды ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я буду присылать ежедневный список задач в привязанный топик.\n"
         "Команды: /bind, /settime HH:MM, /settemplate <текст>, /preview, /postnow, /settz <IANA tz>, /whereami"
     )
-
-
-def require_owner(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        cfg = load_config()
-        owner = cfg.get("owner_id")
-        user_id = update.effective_user.id if update.effective_user else None
-        if owner is None and user_id:
-            cfg["owner_id"] = user_id
-            save_config(cfg)
-        elif owner is not None and owner != user_id:
-            await update.message.reply_text("Только владелец бота может это делать.")
-            return
-        return await func(update, context)
-    return wrapper
 
 
 @require_owner
@@ -103,7 +107,7 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Привязано!\nchat_id = {cfg['chat_id']}\nthread_id = {cfg['thread_id']}"
     )
-    await reschedule_jobs(context.application)
+    reschedule_jobs(context.application)
 
 
 @require_owner
@@ -112,12 +116,12 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Формат: /settime HH:MM")
         return
     hhmm = context.args[0]
-    _ = parse_hhmm(hhmm)
+    _ = parse_hhmm(hhmm)  # валидация
     cfg = load_config()
     cfg["time"] = hhmm
     save_config(cfg)
     await update.message.reply_text(f"Время обновлено: {hhmm}")
-    await reschedule_jobs(context.application)
+    reschedule_jobs(context.application)
 
 
 @require_owner
@@ -133,7 +137,7 @@ async def settz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg["tz"] = tzname
     save_config(cfg)
     await update.message.reply_text(f"Часовой пояс обновлён: {tzname}")
-    await reschedule_jobs(context.application)
+    reschedule_jobs(context.application)
 
 
 @require_owner
@@ -181,13 +185,13 @@ async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def reschedule_jobs(app: Application):
+# === Планировщик ===
+def reschedule_jobs(app: Application):
     if app.job_queue is None:
         return
-
-    # Часовой пояс для планировщика (в v21 tz через scheduler.configure)
     cfg = load_config()
     tzinfo = tz.gettz(cfg.get("tz", DEFAULT_TZ))
+    # Правильный способ поставить таймзону в PTB v21:
     app.job_queue.scheduler.configure(timezone=tzinfo)
 
     # Снимаем старые задания с этим именем
@@ -195,7 +199,6 @@ async def reschedule_jobs(app: Application):
         job.schedule_removal()
 
     when = parse_hhmm(cfg.get("time", "09:00"))
-
     app.job_queue.run_daily(
         callback=send_tasks,
         time=when,
@@ -204,18 +207,26 @@ async def reschedule_jobs(app: Application):
     )
 
 
-async def main():
+# === post_init для подготовки перед стартом ===
+async def post_init(app: Application):
+    # На всякий случай: убираем вебхук и старые апдейты
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    # Планируем ежедневную отправку
+    reschedule_jobs(app)
+
+
+# === Точка входа (СИНХРОННАЯ) ===
+def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
 
-    application = Application.builder().token(token).build()
-
-    # Инициализация
-    await application.initialize()
-
-    # На всякий случай убираем вебхук и старые апдейты
-    await application.bot.delete_webhook(drop_pending_updates=True)
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)  # хук выполнится перед запуском polling
+        .build()
+    )
 
     # Хендлеры
     application.add_handler(CommandHandler("start", start))
@@ -227,23 +238,17 @@ async def main():
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("settz", settz_cmd))
 
-    # Планировщик
-    await reschedule_jobs(application)
-
-    # Стартуем polling и блокируемся тут. Если что-то пойдёт не так — увидим исключение в логах
     print("Starting polling ...", flush=True)
-    await application.run_polling(
+    application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        stop_signals=None,  # Render посылает SIGTERM/SIGINT — позволим PTB корректно остановиться
     )
     print("Polling stopped", flush=True)
 
 
 if __name__ == "__main__":
-    # Гарантируем, что исключения попадут в лог
     try:
-        asyncio.run(main())
+        main()
     except Exception as e:
         print(f"FATAL: {e!r}", flush=True)
         raise
