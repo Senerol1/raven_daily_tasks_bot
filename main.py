@@ -10,9 +10,10 @@ import pytz
 from telegram import Update
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    JobQueue,   # ВАЖНО: используем JobQueue с таймзоной
+    Defaults,       # <-- здесь зададим tzinfo
 )
 
 # ----------------------------
@@ -24,7 +25,7 @@ DEFAULT_CFG = {
     "tasks": [],                 # список задач (строки)
     "target_chat_id": None,      # куда слать ежедневно (chat_id)
     "target_thread_id": None,    # в какую ветку (message_thread_id)
-    "send_time": "09:00",        # время ежедневной отправки (HH:MM)
+    "send_time": "09:00",        # время ежедневной отправки (HH:MM) в заданной tz
     "post_on_start": False       # отправлять ли один раз при старте
 }
 
@@ -238,10 +239,8 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def reschedule_jobs(app: Application, *, first_run: bool = False):
     """
     Перепланировать ежедневную отправку.
-    Таймзона задана в JobQueue при создании приложения.
+    Таймзона берётся из Application.defaults.tzinfo.
     """
-    from telegram.ext import ContextTypes
-
     cfg = load_config()
 
     # Удалим старую задачу, если есть
@@ -259,7 +258,7 @@ def reschedule_jobs(app: Application, *, first_run: bool = False):
         return
 
     hh, mm = map(int, send_time_str.split(":"))
-    # ВАЖНО: time без tzinfo — JobQueue сам применит свою таймзону
+    # ВАЖНО: time без tzinfo — JobQueue применит tz из Defaults(tzinfo=...)
     send_time = dt_time(hour=hh, minute=mm)
 
     async def _job_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -305,13 +304,12 @@ async def main():
         raise RuntimeError("Переменная окружения BOT_TOKEN не установлена")
 
     tzinfo = get_tzinfo()
-    # Создаём JobQueue с нужной таймзоной и отдаём билдеру
-    jq = JobQueue(timezone=tzinfo)
+    defaults = Defaults(tzinfo=tzinfo)  # <-- так задаём таймзону для JobQueue
 
-    application = (
-        Application.builder()
+    application: Application = (
+        ApplicationBuilder()
         .token(BOT_TOKEN)
-        .job_queue(jq)      # <-- вместо .timezone(...)
+        .defaults(defaults)
         .concurrent_updates(True)
         .build()
     )
@@ -330,7 +328,7 @@ async def main():
     application.add_handler(CommandHandler("tasks", listtasks_cmd))  # алиас
     application.add_error_handler(error_handler)
 
-    # Запланируем
+    # Планирование
     reschedule_jobs(application, first_run=False)
 
     print("Starting polling ...", flush=True)
