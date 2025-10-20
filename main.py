@@ -72,11 +72,15 @@ async def send_tasks_message(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Команды ----------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Я жив. Команды: /whereami, /bind, /addtask <текст>, /listtasks, /postnow"
+    )
+
 async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     thread_id = update.message.message_thread_id if update.message and update.message.is_topic_message else None
     await update.message.reply_text(f"chat_id = {chat_id}\nthread_id = {thread_id}")
-
 
 async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -84,7 +88,6 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["thread_id"] = update.message.message_thread_id if update.message and update.message.is_topic_message else None
     save_data(data)
     await update.message.reply_text("Привязано! Ежедневная рассылка будет сюда.")
-
 
 async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.split(maxsplit=1)
@@ -96,11 +99,9 @@ async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text(f"Добавил задачу: {parts[1].strip()}")
 
-
 async def cmd_listtasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     await update.message.reply_text(render_tasks(data["tasks"]), parse_mode=ParseMode.MARKDOWN)
-
 
 async def cmd_postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_tasks_message(context)
@@ -126,8 +127,14 @@ async def handle_update(request: web.Request):
     app = request.app["telegram_app"]
     try:
         payload = await request.json()
+        # ЛОГИ входящего апдейта (коротко)
+        kind = payload.get("message", {}).get("text") or payload.get("message", {}).get("caption") or list(payload.keys())[0]
+        print(f"➡️  webhook update: {kind!r}")
+
         update = Update.de_json(payload, app.bot)
         await app.process_update(update)
+
+        print("✅ processed")
         return web.Response(text="ok")
     except Exception as e:
         print("❌ Ошибка обработки вебхука:", repr(e))
@@ -145,6 +152,7 @@ async def main():
 
     # Собираем приложение и регистрируем хендлеры
     application = ApplicationBuilder().token(token).build()
+    application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("whereami", cmd_whereami))
     application.add_handler(CommandHandler("bind", cmd_bind))
     application.add_handler(CommandHandler("addtask", cmd_addtask))
@@ -154,33 +162,32 @@ async def main():
     # Планировщик
     schedule_daily_job(application, tzinfo)
 
-    # ВАЖНО: инициализируем и запускаем PTB-приложение,
-    # иначе process_update не будет реально обрабатывать апдейты.
+    # Включаем PTB
     await application.initialize()
     await application.start()
 
-    # Вебхук в Telegram
-    webhook_url = f"{base_url.rstrip('/')}/{token}"
+    # Регистрируем вебхук в Telegram
+    webhook_path = f"/{token}"
+    webhook_url = f"{base_url.rstrip('/')}{webhook_path}"
     await application.bot.delete_webhook(drop_pending_updates=True)
     await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
 
     # aiohttp-сервер
     web_app = web.Application()
     web_app["telegram_app"] = application
-    web_app.add_routes([web.get("/", health), web.post(f"/{token}", handle_update)])
+    web_app.add_routes([web.get("/", health), web.post(webhook_path, handle_update)])
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print(f"✅ Webhook сервер запущен и PTB запущен. URL: {webhook_url}")
+    print(f"✅ PTB запущен. Webhook слушает порт {port}. URL: {webhook_url}")
 
-    # держим процесс живым
     try:
         await asyncio.Event().wait()
     finally:
-        # корректное выключение (на будущее)
         await application.stop()
         await application.shutdown()
 
