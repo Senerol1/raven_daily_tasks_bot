@@ -7,11 +7,10 @@ import pytz
 from tzlocal import get_localzone
 from aiohttp import web
 
-from telegram import Update, Poll
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
-    Application,
     CommandHandler,
     ContextTypes,
 )
@@ -71,26 +70,6 @@ async def send_tasks_message(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    chat_id = data.get("chat_id")
-    thread_id = data.get("thread_id")
-    tasks = data.get("tasks", [])
-    if not chat_id:
-        return
-    if not tasks:
-        await send_tasks_message(context)
-        return
-    await context.bot.send_poll(
-        chat_id=chat_id,
-        message_thread_id=thread_id,
-        question="Ежедневный чек-лист",
-        options=tasks,
-        allows_multiple_answers=True,
-        is_anonymous=False,
-    )
-
-
 # ===== Команды =====
 async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -127,13 +106,8 @@ async def cmd_postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправил текущий список задач.")
 
 
-async def cmd_pollnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_tasks_poll(context)
-    await update.message.reply_text("Отправил опрос по задачам.")
-
-
 # ===== Планировщик =====
-def schedule_daily_job(app: Application, tzinfo):
+def schedule_daily_job(app, tzinfo):
     data = load_data()
     H, M = parse_send_time(data.get("send_time", os.getenv("SEND_TIME", "09:00")))
     for j in app.job_queue.jobs():
@@ -148,6 +122,17 @@ async def health(request):
 
 
 # ===== main =====
+async def handle_update(request, app):
+    try:
+        update_data = await request.json()
+        update = Update.de_json(update_data, app.bot)
+        await app.process_update(update)
+        return web.Response(text="ok")
+    except Exception as e:
+        print(f"Ошибка обработки обновления: {e}")
+        return web.Response(status=500, text="error")
+
+
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
     base_url = os.getenv("BASE_URL")
@@ -160,28 +145,24 @@ async def main():
 
     app = ApplicationBuilder().token(token).build()
 
-    # Команды
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("bind", cmd_bind))
     app.add_handler(CommandHandler("addtask", cmd_addtask))
     app.add_handler(CommandHandler("listtasks", cmd_listtasks))
     app.add_handler(CommandHandler("postnow", cmd_postnow))
-    app.add_handler(CommandHandler("pollnow", cmd_pollnow))
 
     schedule_daily_job(app, tzinfo)
 
-    # Настраиваем вебхук
     port = int(os.getenv("PORT", "10000"))
     webhook_url = f"{base_url.rstrip('/')}/{token}"
 
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
 
-    # aiohttp сервер
     web_app = web.Application()
     web_app.add_routes([
         web.get("/", health),
-        web.post(f"/{token}", lambda request: app.process_update(Update.de_json(asyncio.run(request.json()), app.bot))),
+        web.post(f"/{token}", lambda request: handle_update(request, app)),
     ])
 
     runner = web.AppRunner(web_app)
