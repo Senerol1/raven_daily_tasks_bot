@@ -3,6 +3,7 @@ import json
 import asyncio
 from datetime import time as dtime
 from typing import List, Tuple
+
 import pytz
 from tzlocal import get_localzone
 from aiohttp import web
@@ -18,7 +19,7 @@ from telegram.ext import (
 DATA_FILE = "data.json"
 
 
-# ===== Работа с данными =====
+# ---------- Хранилище ----------
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {"tasks": [], "chat_id": None, "thread_id": None, "send_time": os.getenv("SEND_TIME", "09:00")}
@@ -36,7 +37,7 @@ def save_data(data: dict):
     os.replace(tmp, DATA_FILE)
 
 
-# ===== Утилиты =====
+# ---------- Утилиты ----------
 def parse_send_time(s: str) -> Tuple[int, int]:
     try:
         hh, mm = s.strip().split(":")
@@ -70,7 +71,7 @@ async def send_tasks_message(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ===== Команды =====
+# ---------- Команды ----------
 async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     thread_id = update.message.message_thread_id if update.message and update.message.is_topic_message else None
@@ -82,7 +83,7 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["chat_id"] = update.effective_chat.id
     data["thread_id"] = update.message.message_thread_id if update.message and update.message.is_topic_message else None
     save_data(data)
-    await update.message.reply_text("Привязано! Теперь ежедневная рассылка будет сюда.")
+    await update.message.reply_text("Привязано! Ежедневная рассылка будет сюда.")
 
 
 async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,68 +107,82 @@ async def cmd_postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправил текущий список задач.")
 
 
-# ===== Планировщик =====
+# ---------- Планировщик ----------
 def schedule_daily_job(app, tzinfo):
     data = load_data()
     H, M = parse_send_time(data.get("send_time", os.getenv("SEND_TIME", "09:00")))
+    # чистим старую джобу, если была
     for j in app.job_queue.jobs():
         if j.name == "daily_tasks":
             j.schedule_removal()
     app.job_queue.run_daily(send_tasks_message, time=dtime(hour=H, minute=M, tzinfo=tzinfo), name="daily_tasks")
 
 
-# ===== Healthcheck =====
-async def health(request):
+# ---------- HTTP ----------
+async def health(_request: web.Request):
     return web.Response(text="OK")
 
-
-# ===== Webhook handler =====
-async def handle_update(request):
+async def handle_update(request: web.Request):
+    app = request.app["telegram_app"]
     try:
-        app = request.app["telegram_app"]
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
+        payload = await request.json()
+        update = Update.de_json(payload, app.bot)
         await app.process_update(update)
         return web.Response(text="ok")
     except Exception as e:
-        print("Ошибка обработки вебхука:", e)
+        print("❌ Ошибка обработки вебхука:", repr(e))
         return web.Response(status=500, text="error")
 
 
-# ===== main =====
+# ---------- main ----------
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
     base_url = os.getenv("BASE_URL")
-
     if not token or not base_url:
         raise RuntimeError("Нужны TELEGRAM_TOKEN и BASE_URL")
 
     tzinfo = pytz.timezone(os.getenv("TZ", str(get_localzone())))
 
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("whereami", cmd_whereami))
-    app.add_handler(CommandHandler("bind", cmd_bind))
-    app.add_handler(CommandHandler("addtask", cmd_addtask))
-    app.add_handler(CommandHandler("listtasks", cmd_listtasks))
-    app.add_handler(CommandHandler("postnow", cmd_postnow))
+    # Собираем приложение и регистрируем хендлеры
+    application = ApplicationBuilder().token(token).build()
+    application.add_handler(CommandHandler("whereami", cmd_whereami))
+    application.add_handler(CommandHandler("bind", cmd_bind))
+    application.add_handler(CommandHandler("addtask", cmd_addtask))
+    application.add_handler(CommandHandler("listtasks", cmd_listtasks))
+    application.add_handler(CommandHandler("postnow", cmd_postnow))
 
-    schedule_daily_job(app, tzinfo)
+    # Планировщик
+    schedule_daily_job(application, tzinfo)
 
+    # ВАЖНО: инициализируем и запускаем PTB-приложение,
+    # иначе process_update не будет реально обрабатывать апдейты.
+    await application.initialize()
+    await application.start()
+
+    # Вебхук в Telegram
     webhook_url = f"{base_url.rstrip('/')}/{token}"
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
 
+    # aiohttp-сервер
     web_app = web.Application()
-    web_app["telegram_app"] = app
+    web_app["telegram_app"] = application
     web_app.add_routes([web.get("/", health), web.post(f"/{token}", handle_update)])
 
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
-    print(f"✅ Webhook сервер запущен: {webhook_url}")
     await site.start()
 
-    await asyncio.Event().wait()
+    print(f"✅ Webhook сервер запущен и PTB запущен. URL: {webhook_url}")
+
+    # держим процесс живым
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # корректное выключение (на будущее)
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
