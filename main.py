@@ -220,6 +220,8 @@ async def main():
 
     # ВАЖНО: сначала инициализируем, чтобы появился job_queue
     await application.initialize()
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 
     # Регистрируем команды
     application.add_handler(CommandHandler("start", start))
