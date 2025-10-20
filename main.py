@@ -1,196 +1,242 @@
+# main.py
 import os
 import json
 import asyncio
-from datetime import time as dtime
-from typing import List, Tuple
+from datetime import datetime, time as dtime
+from typing import Dict, Any, List, Optional
 
-import pytz
-from tzlocal import get_localzone
 from aiohttp import web
+from pytz import timezone
+from tzlocal import get_localzone
 
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
+    Application, ApplicationBuilder,
+    CommandHandler, ContextTypes
 )
 
-DATA_FILE = "data.json"
-
+STATE_PATH = "state.json"
 
 # ---------- Хранилище ----------
-def load_data() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {"tasks": [], "chat_id": None, "thread_id": None, "send_time": os.getenv("SEND_TIME", "09:00")}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"tasks": [], "chat_id": None, "thread_id": None, "send_time": os.getenv("SEND_TIME", "09:00")}
+def load_state() -> Dict[str, Any]:
+    if os.path.exists(STATE_PATH):
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                pass
+    return {
+        "chat_id": None,
+        "thread_id": None,
+        "send_time": "09:00",    # HH:MM локальное время сервера
+        "tasks": []              # список строк
+    }
 
-
-def save_data(data: dict):
-    tmp = DATA_FILE + ".tmp"
+def save_state(state: Dict[str, Any]) -> None:
+    tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
 
+STATE = load_state()
+
+def tzinfo():
+    # таймзона сервера (на Render — обычно UTC)
+    try:
+        return get_localzone()
+    except Exception:
+        return timezone("UTC")
 
 # ---------- Утилиты ----------
-def parse_send_time(s: str) -> Tuple[int, int]:
+def parse_time_str(hhmm: str) -> Optional[dtime]:
     try:
-        hh, mm = s.strip().split(":")
-        return max(0, min(23, int(hh))), max(0, min(59, int(mm)))
+        hh, mm = hhmm.strip().split(":")
+        return dtime(hour=int(hh), minute=int(mm), second=0)
     except Exception:
-        return 9, 0
+        return None
 
+def chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-def render_tasks(tasks: List[str]) -> str:
+# ---------- Отправка задач как POLL ----------
+async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, thread_id: Optional[int]) -> None:
+    tasks: List[str] = STATE.get("tasks", [])
     if not tasks:
-        return "Пока задач нет. Добавь через /addtask <текст>"
-    text = ["📝 *Ваш список задач:*"]
-    for i, t in enumerate(tasks, 1):
-        text.append(f"{i}. {t}")
-    return "\n".join(text)
-
-
-async def send_tasks_message(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    chat_id = data.get("chat_id")
-    thread_id = data.get("thread_id")
-    if not chat_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Список задач пуст.",
+            message_thread_id=thread_id
+        )
         return
-    text = render_tasks(data.get("tasks", []))
-    await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=thread_id,
-        text=text,
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
 
+    # Telegram ограничивает poll максимум 10 опциями
+    groups = chunk(tasks, 10)
+    today = datetime.now(tzinfo()).strftime("%d.%m.%Y")
 
-# ---------- Команды ----------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Я жив. Команды: /whereami, /bind, /addtask <текст>, /listtasks, /postnow"
-    )
+    for idx, group in enumerate(groups, start=1):
+        question = f"Ежедневные задачи — {today}"
+        if len(groups) > 1:
+            question += f" ({idx}/{len(groups)})"
 
-async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    thread_id = update.message.message_thread_id if update.message and update.message.is_topic_message else None
-    await update.message.reply_text(f"chat_id = {chat_id}\nthread_id = {thread_id}")
-
-async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    data["chat_id"] = update.effective_chat.id
-    data["thread_id"] = update.message.message_thread_id if update.message and update.message.is_topic_message else None
-    save_data(data)
-    await update.message.reply_text("Привязано! Ежедневная рассылка будет сюда.")
-
-async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text("Использование: /addtask <текст>")
-        return
-    data = load_data()
-    data["tasks"].append(parts[1].strip())
-    save_data(data)
-    await update.message.reply_text(f"Добавил задачу: {parts[1].strip()}")
-
-async def cmd_listtasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    await update.message.reply_text(render_tasks(data["tasks"]), parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_tasks_message(context)
-    await update.message.reply_text("Отправил текущий список задач.")
-
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question=question,
+            options=group,
+            is_anonymous=False,
+            allows_multiple_answers=True,
+            message_thread_id=thread_id
+        )
 
 # ---------- Планировщик ----------
-def schedule_daily_job(app, tzinfo):
-    data = load_data()
-    H, M = parse_send_time(data.get("send_time", os.getenv("SEND_TIME", "09:00")))
-    # чистим старую джобу, если была
-    for j in app.job_queue.jobs():
-        if j.name == "daily_tasks":
-            j.schedule_removal()
-    app.job_queue.run_daily(send_tasks_message, time=dtime(hour=H, minute=M, tzinfo=tzinfo), name="daily_tasks")
+def reschedule_daily_job(app: Application) -> None:
+    app.job_queue.scheduler.remove_all_jobs()
+    send_time = parse_time_str(str(STATE.get("send_time", "09:00")))
+    c_id = STATE.get("chat_id")
+    if not (send_time and c_id):
+        print("[reschedule] пропуск: нет chat_id или времени")
+        return
 
+    th_id = STATE.get("thread_id")
+    app.job_queue.run_daily(
+        callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
+        time=send_time,
+        name="daily_tasks_poll",
+        timezone=tzinfo()
+    )
+    print(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tzinfo()})")
 
-# ---------- HTTP ----------
-async def health(_request: web.Request):
-    return web.Response(text="OK")
+# ---------- Команды ----------
+async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    STATE["chat_id"] = chat.id
+    STATE["thread_id"] = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+    save_state(STATE)
 
-async def handle_update(request: web.Request):
-    app = request.app["telegram_app"]
+    # после привязки — пересоздаём расписание
+    reschedule_daily_job(context.application)
+
+    await msg.reply_text(
+        f"Привязано!\nchat_id = {STATE['chat_id']}\nthread_id = {STATE['thread_id']}"
+    )
+
+async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+    await msg.reply_text(f"chat_id = {update.effective_chat.id}\nthread_id = {thread_id}")
+
+async def addtask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.effective_message.reply_text("Использование: /addtask Текст задачи")
+        return
+    STATE.setdefault("tasks", []).append(text)
+    save_state(STATE)
+    await update.effective_message.reply_text(f"Добавил: «{text}». Всего задач: {len(STATE['tasks'])}")
+
+async def listtasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tasks: List[str] = STATE.get("tasks", [])
+    if not tasks:
+        await update.effective_message.reply_text("Список задач пуст.")
+        return
+    lines = "\n".join(f"{i+1}. {t}" for i, t in enumerate(tasks))
+    await update.effective_message.reply_text(lines)
+
+async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text("Использование: /deltask Номер")
+        return
     try:
-        payload = await request.json()
-        # ЛОГИ входящего апдейта (коротко)
-        kind = payload.get("message", {}).get("text") or payload.get("message", {}).get("caption") or list(payload.keys())[0]
-        print(f"➡️  webhook update: {kind!r}")
+        idx = int(context.args[0]) - 1
+    except Exception:
+        await update.effective_message.reply_text("Номер должен быть числом.")
+        return
 
-        update = Update.de_json(payload, app.bot)
-        await app.process_update(update)
+    tasks: List[str] = STATE.get("tasks", [])
+    if 0 <= idx < len(tasks):
+        removed = tasks.pop(idx)
+        save_state(STATE)
+        await update.effective_message.reply_text(f"Удалил: «{removed}». Осталось: {len(tasks)}")
+    else:
+        await update.effective_message.reply_text("Нет задачи с таким номером.")
 
-        print("✅ processed")
+async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.effective_message.reply_text("Использование: /settime HH:MM (локальное время сервера)")
+        return
+    t = parse_time_str(context.args[0])
+    if not t:
+        await update.effective_message.reply_text("Неверный формат. Пример: /settime 10:30")
+        return
+    STATE["send_time"] = context.args[0]
+    save_state(STATE)
+    reschedule_daily_job(context.application)
+    await update.effective_message.reply_text(f"Ок, буду слать каждый день в {STATE['send_time']}.")
+
+async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    c_id = STATE.get("chat_id")
+    th_id = STATE.get("thread_id")
+    if not c_id:
+        await update.effective_message.reply_text("Сначала привяжи чат командой /bind в нужном чате/топике.")
+        return
+    await send_tasks_poll(context, chat_id=c_id, thread_id=th_id)
+    await update.effective_message.reply_text("Отправил задачи как опрос.")
+
+# ---------- Webhook ----------
+async def health(_request):
+    return web.Response(text="ok")
+
+def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
+    aio = web.Application()
+
+    async def handle_update(request: web.Request):
+        data = await request.json()
+        update = Update.de_json(data, ptb_app.bot)
+        await ptb_app.process_update(update)
         return web.Response(text="ok")
-    except Exception as e:
-        print("❌ Ошибка обработки вебхука:", repr(e))
-        return web.Response(status=500, text="error")
 
+    aio.add_routes([
+        web.get("/", health),
+        web.post(f"/{token}", handle_update),
+    ])
+    return aio
 
 # ---------- main ----------
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
-    base_url = os.getenv("BASE_URL")
+    base_url = os.getenv("BASE_URL")  # вида https://raven-daily-tasks-bot.onrender.com  (без / на конце)
     if not token or not base_url:
-        raise RuntimeError("Нужны TELEGRAM_TOKEN и BASE_URL")
+        raise RuntimeError("Нужны переменные окружения TELEGRAM_TOKEN и BASE_URL")
 
-    tzinfo = pytz.timezone(os.getenv("TZ", str(get_localzone())))
+    application: Application = ApplicationBuilder().token(token).build()
 
-    # Собираем приложение и регистрируем хендлеры
-    application = ApplicationBuilder().token(token).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("whereami", cmd_whereami))
-    application.add_handler(CommandHandler("bind", cmd_bind))
-    application.add_handler(CommandHandler("addtask", cmd_addtask))
-    application.add_handler(CommandHandler("listtasks", cmd_listtasks))
-    application.add_handler(CommandHandler("postnow", cmd_postnow))
+    # Хендлеры
+    application.add_handler(CommandHandler("bind", bind_cmd))
+    application.add_handler(CommandHandler("whereami", whereami_cmd))
+    application.add_handler(CommandHandler("addtask", addtask_cmd))
+    application.add_handler(CommandHandler("listtasks", listtasks_cmd))
+    application.add_handler(CommandHandler("deltask", deltask_cmd))
+    application.add_handler(CommandHandler("settime", settime_cmd))
+    application.add_handler(CommandHandler("postnow", postnow_cmd))
 
     # Планировщик
-    schedule_daily_job(application, tzinfo)
+    reschedule_daily_job(application)
 
-    # Включаем PTB
-    await application.initialize()
-    await application.start()
+    # Вебхук
+    await application.bot.set_webhook(
+        url=f"{base_url}/{token}",
+        allowed_updates=Update.ALL_TYPES
+    )
 
-    # Регистрируем вебхук в Telegram
-    webhook_path = f"/{token}"
-    webhook_url = f"{base_url.rstrip('/')}{webhook_path}"
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-
-    # aiohttp-сервер
-    web_app = web.Application()
-    web_app["telegram_app"] = application
-    web_app.add_routes([web.get("/", health), web.post(webhook_path, handle_update)])
-
+    web_app = make_aiohttp_app(application, token)
     runner = web.AppRunner(web_app)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
     await site.start()
+    print(f"✅ Webhook сервер запущен: {base_url}/{token}")
 
-    print(f"✅ PTB запущен. Webhook слушает порт {port}. URL: {webhook_url}")
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await application.stop()
-        await application.shutdown()
-
+    # держим процесс живым
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
