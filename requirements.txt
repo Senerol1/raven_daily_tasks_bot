@@ -1,4 +1,6 @@
 python-telegram-bot[job-queue]==21.7
 python-dateutil==2.9.0.post0
 pytz==2024.2
+tzlocal==5.3.1
+httpx==0.28.1
 aiohttp>=3.9,<4
