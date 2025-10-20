@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from datetime import time as dtime
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import pytz
 from tzlocal import get_localzone
 from aiohttp import web
@@ -10,8 +10,8 @@ from aiohttp import web
 from telegram import Update, Poll
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
+    Application,
     CommandHandler,
     ContextTypes,
 )
@@ -19,9 +19,7 @@ from telegram.ext import (
 DATA_FILE = "data.json"
 
 
-# =======================
-# Работа с данными
-# =======================
+# ===== Работа с данными =====
 def load_data() -> dict:
     if not os.path.exists(DATA_FILE):
         return {"tasks": [], "chat_id": None, "thread_id": None, "send_time": os.getenv("SEND_TIME", "09:00")}
@@ -39,9 +37,7 @@ def save_data(data: dict):
     os.replace(tmp, DATA_FILE)
 
 
-# =======================
-# Вспомогательные функции
-# =======================
+# ===== Утилиты =====
 def parse_send_time(s: str) -> Tuple[int, int]:
     try:
         hh, mm = s.strip().split(":")
@@ -95,9 +91,7 @@ async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =======================
-# Команды
-# =======================
+# ===== Команды =====
 async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     thread_id = update.message.message_thread_id if update.message and update.message.is_topic_message else None
@@ -109,7 +103,7 @@ async def cmd_bind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["chat_id"] = update.effective_chat.id
     data["thread_id"] = update.message.message_thread_id if update.message and update.message.is_topic_message else None
     save_data(data)
-    await update.message.reply_text("Привязано!\nТеперь ежедневная рассылка будет сюда.")
+    await update.message.reply_text("Привязано! Теперь ежедневная рассылка будет сюда.")
 
 
 async def cmd_addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,9 +132,7 @@ async def cmd_pollnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправил опрос по задачам.")
 
 
-# =======================
-# Планировщик
-# =======================
+# ===== Планировщик =====
 def schedule_daily_job(app: Application, tzinfo):
     data = load_data()
     H, M = parse_send_time(data.get("send_time", os.getenv("SEND_TIME", "09:00")))
@@ -150,16 +142,12 @@ def schedule_daily_job(app: Application, tzinfo):
     app.job_queue.run_daily(send_tasks_message, time=dtime(hour=H, minute=M, tzinfo=tzinfo), name="daily_tasks")
 
 
-# =======================
-# Healthcheck
-# =======================
+# ===== Healthcheck =====
 async def health(request):
     return web.Response(text="OK")
 
 
-# =======================
-# main
-# =======================
+# ===== main =====
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
     base_url = os.getenv("BASE_URL")
@@ -172,6 +160,7 @@ async def main():
 
     app = ApplicationBuilder().token(token).build()
 
+    # Команды
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("bind", cmd_bind))
     app.add_handler(CommandHandler("addtask", cmd_addtask))
@@ -181,17 +170,19 @@ async def main():
 
     schedule_daily_job(app, tzinfo)
 
+    # Настраиваем вебхук
     port = int(os.getenv("PORT", "10000"))
-    url_path = token
-    webhook_url = f"{base_url.rstrip('/')}/{url_path}"
+    webhook_url = f"{base_url.rstrip('/')}/{token}"
 
-    # Убираем старый вебхук, ставим новый
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
 
-    # Запускаем aiohttp-сервер вручную
+    # aiohttp сервер
     web_app = web.Application()
-    web_app.add_routes([web.get("/", health), web.post(f"/{token}", app.webhook_update_handler())])
+    web_app.add_routes([
+        web.get("/", health),
+        web.post(f"/{token}", lambda request: app.process_update(Update.de_json(asyncio.run(request.json()), app.bot))),
+    ])
 
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -199,7 +190,6 @@ async def main():
     print(f"✅ Webhook сервер запущен на {port}, URL: {webhook_url}")
     await site.start()
 
-    # Не завершаться
     await asyncio.Event().wait()
 
 
