@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import os
@@ -186,8 +185,12 @@ async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reschedule_jobs(app: Application):
-    # Снимаем старые задачи и ставим новую с текущих настроек
-    for job in app.job_queue.jobs():
+    # После application.initialize() job_queue уже должен быть
+    if app.job_queue is None:
+        return
+
+    # Удаляем предыдущие задания с таким именем (если были)
+    for job in app.job_queue.get_jobs_by_name("daily_tasks"):
         job.schedule_removal()
 
     cfg = load_config()
@@ -211,6 +214,10 @@ async def main():
 
     application = Application.builder().token(token).build()
 
+    # ВАЖНО: сначала инициализируем, чтобы появился job_queue
+    await application.initialize()
+
+    # Регистрируем команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("bind", bind_cmd))
     application.add_handler(CommandHandler("settime", settime_cmd))
@@ -220,10 +227,10 @@ async def main():
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("settz", settz_cmd))
 
+    # Планируем ежедневную задачу (уже после initialize)
     await reschedule_jobs(application)
 
-    # Запуск пуллинга
-    await application.initialize()
+    # Стартуем бота
     await application.start()
     try:
         await application.updater.start_polling(drop_pending_updates=True)
