@@ -189,20 +189,24 @@ async def reschedule_jobs(app: Application):
     if app.job_queue is None:
         return
 
-    # Удаляем предыдущие задания с таким именем (если были)
-    for job in app.job_queue.get_jobs_by_name("daily_tasks"):
-        job.schedule_removal()
-
+    # Считываем настройки
     cfg = load_config()
     tzinfo = tz.gettz(cfg.get("tz", DEFAULT_TZ))
     hhmm = cfg.get("time", "09:00")
     when = parse_hhmm(hhmm)
 
+    # Обновляем таймзону у планировщика (APSCHEDULER) — ГЛАВНОЕ ИЗМЕНЕНИЕ
+    app.job_queue.scheduler.configure(timezone=tzinfo)
+
+    # Удаляем предыдущие задания с таким именем
+    for job in app.job_queue.get_jobs_by_name("daily_tasks"):
+        job.schedule_removal()
+
+    # Ставим ежедневную задачу БЕЗ tzinfo в аргументах (его теперь нет в v21)
     app.job_queue.run_daily(
         callback=send_tasks,
         time=when,
         days=(0, 1, 2, 3, 4, 5, 6),
-        tzinfo=tzinfo,
         name="daily_tasks",
     )
 
