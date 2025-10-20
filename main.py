@@ -5,9 +5,7 @@ from datetime import datetime, time
 from dateutil import tz
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 CONFIG_PATH = "config.json"
 DEFAULT_TEMPLATE = (
@@ -16,8 +14,6 @@ DEFAULT_TEMPLATE = (
     "— [ ] 2\n"
     "— [ ] 3\n"
 )
-
-# Часовой пояс бота по умолчанию (можно сменить командой)
 DEFAULT_TZ = os.getenv("BOT_TZ", "Asia/Nicosia")
 
 
@@ -26,7 +22,7 @@ def load_config():
         return {
             "chat_id": None,
             "thread_id": None,
-            "time": "09:00",  # HH:MM
+            "time": "09:00",
             "tz": DEFAULT_TZ,
             "template": DEFAULT_TEMPLATE,
             "owner_id": None,
@@ -56,7 +52,7 @@ async def send_tasks(context: ContextTypes.DEFAULT_TYPE):
         username=context.bot.name,
     )
 
-    if chat_id is None or (thread_id is None):
+    if not chat_id or thread_id is None:
         return
 
     await context.bot.send_message(
@@ -85,7 +81,6 @@ def require_owner(func):
         cfg = load_config()
         owner = cfg.get("owner_id")
         user_id = update.effective_user.id if update.effective_user else None
-        # Первый вызов любым пользователем назначает owner
         if owner is None and user_id:
             cfg["owner_id"] = user_id
             save_config(cfg)
@@ -144,14 +139,14 @@ async def settz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_owner
 async def settemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    # Обрезаем команду
-    without_cmd = text.split(" ", 1)
-    if len(without_cmd) < 2:
+    parts = text.split(" ", 1)
+    if len(parts) < 2:
         await update.message.reply_text(
-            "Формат: /settemplate <текст шаблона>\nДоступные плейсхолдеры: {date}, {weekday}, {time}, {username}"
+            "Формат: /settemplate <текст шаблона>\n"
+            "Доступные плейсхолдеры: {date}, {weekday}, {time}, {username}"
         )
         return
-    template = without_cmd[1]
+    template = parts[1]
     cfg = load_config()
     cfg["template"] = template
     save_config(cfg)
@@ -168,7 +163,9 @@ async def preview_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         time=now.strftime("%H:%M"),
         username=context.bot.name,
     )
-    await update.message.reply_text(payload, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await update.message.reply_text(
+        payload, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 
 @require_owner
@@ -185,24 +182,20 @@ async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reschedule_jobs(app: Application):
-    # После application.initialize() job_queue уже должен быть
     if app.job_queue is None:
         return
 
-    # Считываем настройки
+    # Часовой пояс для планировщика (в v21 tz через scheduler.configure)
     cfg = load_config()
     tzinfo = tz.gettz(cfg.get("tz", DEFAULT_TZ))
-    hhmm = cfg.get("time", "09:00")
-    when = parse_hhmm(hhmm)
-
-    # Обновляем таймзону у планировщика (APSCHEDULER) — ГЛАВНОЕ ИЗМЕНЕНИЕ
     app.job_queue.scheduler.configure(timezone=tzinfo)
 
-    # Удаляем предыдущие задания с таким именем
+    # Снимаем старые задания с этим именем
     for job in app.job_queue.get_jobs_by_name("daily_tasks"):
         job.schedule_removal()
 
-    # Ставим ежедневную задачу БЕЗ tzinfo в аргументах (его теперь нет в v21)
+    when = parse_hhmm(cfg.get("time", "09:00"))
+
     app.job_queue.run_daily(
         callback=send_tasks,
         time=when,
@@ -216,19 +209,15 @@ async def main():
     if not token:
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
 
-    public_url = os.getenv("PUBLIC_URL")
-    if not public_url:
-        raise RuntimeError("Установите переменную окружения PUBLIC_URL (адрес Render)")
-
     application = Application.builder().token(token).build()
 
     # Инициализация
     await application.initialize()
 
-    # На всякий случай: убрать старый вебхук и старые апдейты
+    # На всякий случай убираем вебхук и старые апдейты
     await application.bot.delete_webhook(drop_pending_updates=True)
 
-    # Регистрируем команды
+    # Хендлеры
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("bind", bind_cmd))
     application.add_handler(CommandHandler("settime", settime_cmd))
@@ -238,25 +227,23 @@ async def main():
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("settz", settz_cmd))
 
-    # Планируем ежедневную задачу
+    # Планировщик
     await reschedule_jobs(application)
 
-    # Старт приложения
-    await application.start()
-
-    # Настраиваем webhook
-    from urllib.parse import urljoin
-    webhook_path = f"/webhook/{token}"
-    full_webhook_url = urljoin(public_url, webhook_path)
-
-    await application.bot.set_webhook(url=full_webhook_url)
-
-    # Поднимаем встроенный веб-сервер Telegram Bot API (aiohttp) на $PORT
-    port = int(os.getenv("PORT", "8080"))
-
-    # run_webhook — блокирующий цикл (пока работает сервис)
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_path=webhook_path,
+    # Стартуем polling и блокируемся тут. Если что-то пойдёт не так — увидим исключение в логах
+    print("Starting polling ...", flush=True)
+    await application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        stop_signals=None,  # Render посылает SIGTERM/SIGINT — позволим PTB корректно остановиться
     )
+    print("Polling stopped", flush=True)
+
+
+if __name__ == "__main__":
+    # Гарантируем, что исключения попадут в лог
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"FATAL: {e!r}", flush=True)
+        raise
