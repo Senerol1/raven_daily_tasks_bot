@@ -121,30 +121,30 @@ async def health(request):
     return web.Response(text="OK")
 
 
-# ===== main =====
-async def handle_update(request, app):
+# ===== Webhook handler =====
+async def handle_update(request):
     try:
-        update_data = await request.json()
-        update = Update.de_json(update_data, app.bot)
+        app = request.app["telegram_app"]
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
         await app.process_update(update)
         return web.Response(text="ok")
     except Exception as e:
-        print(f"Ошибка обработки обновления: {e}")
+        print("Ошибка обработки вебхука:", e)
         return web.Response(status=500, text="error")
 
 
+# ===== main =====
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
     base_url = os.getenv("BASE_URL")
 
     if not token or not base_url:
-        raise RuntimeError("Нужны переменные окружения TELEGRAM_TOKEN и BASE_URL")
+        raise RuntimeError("Нужны TELEGRAM_TOKEN и BASE_URL")
 
-    tz_name = os.getenv("TZ")
-    tzinfo = pytz.timezone(tz_name) if tz_name else get_localzone()
+    tzinfo = pytz.timezone(os.getenv("TZ", str(get_localzone())))
 
     app = ApplicationBuilder().token(token).build()
-
     app.add_handler(CommandHandler("whereami", cmd_whereami))
     app.add_handler(CommandHandler("bind", cmd_bind))
     app.add_handler(CommandHandler("addtask", cmd_addtask))
@@ -153,22 +153,18 @@ async def main():
 
     schedule_daily_job(app, tzinfo)
 
-    port = int(os.getenv("PORT", "10000"))
     webhook_url = f"{base_url.rstrip('/')}/{token}"
-
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
 
     web_app = web.Application()
-    web_app.add_routes([
-        web.get("/", health),
-        web.post(f"/{token}", lambda request: handle_update(request, app)),
-    ])
+    web_app["telegram_app"] = app
+    web_app.add_routes([web.get("/", health), web.post(f"/{token}", handle_update)])
 
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    print(f"✅ Webhook сервер запущен на {port}, URL: {webhook_url}")
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+    print(f"✅ Webhook сервер запущен: {webhook_url}")
     await site.start()
 
     await asyncio.Event().wait()
