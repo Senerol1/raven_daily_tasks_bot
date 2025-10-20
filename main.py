@@ -216,12 +216,17 @@ async def main():
     if not token:
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
 
+    public_url = os.getenv("PUBLIC_URL")
+    if not public_url:
+        raise RuntimeError("Установите переменную окружения PUBLIC_URL (адрес Render)")
+
     application = Application.builder().token(token).build()
 
-    # ВАЖНО: сначала инициализируем, чтобы появился job_queue
+    # Инициализация
     await application.initialize()
-    await application.bot.delete_webhook(drop_pending_updates=True)
 
+    # На всякий случай: убрать старый вебхук и старые апдейты
+    await application.bot.delete_webhook(drop_pending_updates=True)
 
     # Регистрируем команды
     application.add_handler(CommandHandler("start", start))
@@ -233,20 +238,25 @@ async def main():
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("settz", settz_cmd))
 
-    # Планируем ежедневную задачу (уже после initialize)
+    # Планируем ежедневную задачу
     await reschedule_jobs(application)
 
-    # Стартуем бота
+    # Старт приложения
     await application.start()
-    try:
-        await application.updater.start_polling(drop_pending_updates=True)
-        print("Bot started")
-        await asyncio.Event().wait()
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
 
+    # Настраиваем webhook
+    from urllib.parse import urljoin
+    webhook_path = f"/webhook/{token}"
+    full_webhook_url = urljoin(public_url, webhook_path)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    await application.bot.set_webhook(url=full_webhook_url)
+
+    # Поднимаем встроенный веб-сервер Telegram Bot API (aiohttp) на $PORT
+    port = int(os.getenv("PORT", "8080"))
+
+    # run_webhook — блокирующий цикл (пока работает сервис)
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_path=webhook_path,
+    )
