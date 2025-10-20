@@ -254,25 +254,64 @@ async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # === Планировщик ===
-def reschedule_jobs(app: Application):
-    if app.job_queue is None:
-        return
+def reschedule_jobs(app, *, first_run=False):
+    """
+    Перепланировать ежедневную отправку без попытки re-configure() уже запущенного APScheduler.
+    first_run=True можно вызывать при старте приложения; в остальных случаях — False.
+    """
     cfg = load_config()
-    tzinfo = tz.gettz(cfg.get("tz", DEFAULT_TZ))
-    # Установим таймзону планировщику
-    app.job_queue.scheduler.configure(timezone=tzinfo)
 
-    # Удалим старые задания с этим именем
-    for job in app.job_queue.get_jobs_by_name("daily_tasks"):
-        job.schedule_removal()
+    # 1) Не трогаем scheduler.configure(...), если он уже запущен — иначе ловим SchedulerAlreadyRunningError.
+    # Таймзону задаём один раз через Application.builder().timezone(...) при старте.
+    # Если очень нужно сменить TZ на лету — делаем это только после полной перезагрузки процесса.
 
-    when = parse_hhmm(cfg.get("time", "09:00"))
+    # 2) Удалим старые задачи с таким именем (если есть)
+    try:
+        for job in list(app.job_queue.jobs()):
+            if job.name == "daily_tasks":
+                job.schedule_removal()
+    except Exception as e:
+        print(f"[reschedule_jobs] skip cleanup jobs error: {e!r}", flush=True)
+
+    # 3) Создадим новую ежедневную задачу, если есть привязка и время
+    chat_id = cfg.get("target_chat_id")
+    thread_id = cfg.get("target_thread_id")
+    send_time_str = cfg.get("send_time")  # формат HH:MM, например "09:00"
+
+    if not chat_id or not send_time_str:
+        print("[reschedule_jobs] no chat_id or no send_time -> skip scheduling", flush=True)
+        return
+
+    # Разбираем время (локальное для JobQueue — он сам применит свою timezone)
+    hh, mm = map(int, send_time_str.split(":"))
+    send_time = time(hour=hh, minute=mm)  # из datetime import time
+
+    # Обёртка, чтобы прокинуть thread_id/шаблон из конфига
+    async def _job_callback(context: ContextTypes.DEFAULT_TYPE):
+        await send_tasks(context, force=True)  # твоя функция отправки (Poll/текст)
+
+    # 4) Регистрируем ежедневную джобу
     app.job_queue.run_daily(
-        callback=send_tasks,
-        time=when,
+        _job_callback,
+        time=send_time,                      # !!! Без tzinfo — он не поддерживается в PTB 21.7
         days=(0, 1, 2, 3, 4, 5, 6),
         name="daily_tasks",
+        job_kwargs={"misfire_grace_time": 3600},  # если Render проспал — отправим в течение часа
     )
+
+    # 5) Первый запуск по желанию (например, при старте)
+    if first_run and cfg.get("post_on_start"):
+        # Без крашей, если что-то не так
+        async def _once(ctx):
+            try:
+                await send_tasks(ctx, force=True)
+            except Exception as e:
+                print(f"[reschedule_jobs] first_run send error: {e!r}", flush=True)
+
+        app.job_queue.run_once(_once, when=1, name="daily_tasks_first_run")
+
+    print("[reschedule_jobs] scheduled daily_tasks at", send_time_str, "for chat", chat_id, "thread", thread_id, flush=True)
+
 
 # === post_init ===
 async def post_init(app: Application):
