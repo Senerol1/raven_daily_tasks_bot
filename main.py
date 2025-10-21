@@ -136,6 +136,7 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(
         f"Привязано!\nchat_id = {STATE['chat_id']}\nthread_id = {STATE['thread_id']}"
     )
+    log.info("/bind ok: chat_id=%s thread_id=%s", STATE['chat_id'], STATE['thread_id'])
 
 
 async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,9 +184,11 @@ async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cleartasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Полное очищение списка задач
     STATE["tasks"] = []
     save_state(STATE)
     await update.effective_message.reply_text("Готово: список задач очищен.")
+    log.info("/cleartasks ok")
 
 
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -212,10 +215,28 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text("Отправил задачи как опрос.")
 
 
-async def any_command_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Фоллбэк на неизвестные команды
-    cmd = update.effective_message.text or ""
-    await update.effective_message.reply_text(f"Команда получена: {cmd}")
+# ---------------- ФОЛЛБЭК ТОЛЬКО ДЛЯ НЕИЗВЕСТНЫХ КОМАНД ----------------
+KNOWN_CMDS = {
+    "bind", "whereami", "addtask", "listtasks", "deltask",
+    "cleartasks", "settime", "postnow"
+}
+
+def is_unknown_command(text: Optional[str]) -> bool:
+    if not text or not text.startswith("/"):
+        return False
+    # Берём первую "словную" часть без аргументов, слэшей и @бота
+    cmd = text.split()[0]          # "/cleartasks@BotName"
+    cmd = cmd.split("@")[0]        # "/cleartasks"
+    cmd = cmd.lstrip("/")          # "cleartasks"
+    return cmd.lower() not in KNOWN_CMDS
+
+
+async def unknown_command_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.effective_message.text or ""
+    # если это известная команда — молча игнор (её обработает соответствующий хэндлер)
+    if not is_unknown_command(text):
+        return
+    await update.effective_message.reply_text(f"Команда получена: {text}")
 
 
 # ---------------- ОШИБКИ ----------------
@@ -235,18 +256,19 @@ def main():
 
     app: Application = ApplicationBuilder().token(token).build()
 
-    # Команды
-    app.add_handler(CommandHandler("bind", bind_cmd))
-    app.add_handler(CommandHandler("whereami", whereami_cmd))
-    app.add_handler(CommandHandler("addtask", addtask_cmd))
-    app.add_handler(CommandHandler("listtasks", listtasks_cmd))
-    app.add_handler(CommandHandler("deltask", deltask_cmd))
-    app.add_handler(CommandHandler("cleartasks", cleartasks_cmd))
-    app.add_handler(CommandHandler("settime", settime_cmd))
-    app.add_handler(CommandHandler("postnow", postnow_cmd))
+    # Команды (регистрируем раньше всего)
+    app.add_handler(CommandHandler(["bind"], bind_cmd))
+    app.add_handler(CommandHandler(["whereami"], whereami_cmd))
+    app.add_handler(CommandHandler(["addtask"], addtask_cmd))
+    app.add_handler(CommandHandler(["listtasks"], listtasks_cmd))
+    app.add_handler(CommandHandler(["deltask"], deltask_cmd))
+    app.add_handler(CommandHandler(["cleartasks", "clear", "clear_tasks"], cleartasks_cmd))
+    app.add_handler(CommandHandler(["settime"], settime_cmd))
+    app.add_handler(CommandHandler(["postnow"], postnow_cmd))
 
-    # Фоллбэк на любые неизвестные /команды
-    app.add_handler(MessageHandler(filters.COMMAND, any_command_echo))
+    # Фоллбэк: только для неизвестных /команд.
+    # Ставим в другую группу (group=1), чтобы не перебивать известные хэндлеры.
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command_echo), group=1)
 
     # Глобальный обработчик ошибок
     app.add_error_handler(on_error)
@@ -255,7 +277,6 @@ def main():
     reschedule_daily_job(app)
 
     log.info("Стартую webhook на порту %s | webhook=%s/%s", port, base_url, token)
-    # ВАЖНО: метод синхронный и сам управляет event loop
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
