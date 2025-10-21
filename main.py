@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, time as dtime, timezone
 
 from tzlocal import get_localzone
-
 from telegram import Update
 from telegram.ext import (
     Application, ApplicationBuilder,
@@ -22,7 +21,6 @@ log = logging.getLogger("bot")
 
 STATE_PATH = "state.json"
 
-
 # ---------------- СОСТОЯНИЕ ----------------
 def load_state() -> Dict[str, Any]:
     if os.path.exists(STATE_PATH):
@@ -33,24 +31,19 @@ def load_state() -> Dict[str, Any]:
             pass
     return {"chat_id": None, "thread_id": None, "send_time": "09:00", "tasks": []}
 
-
 def save_state(state: Dict[str, Any]) -> None:
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
 
-
 STATE = load_state()
 
-
 def tzinfo():
-    # Локальный TZ; фоллбэк — UTC
     try:
         return get_localzone()
     except Exception:
         return timezone.utc
-
 
 # ---------------- УТИЛИТЫ ----------------
 def parse_time_str(hhmm: str, tz) -> Optional[dtime]:
@@ -60,10 +53,8 @@ def parse_time_str(hhmm: str, tz) -> Optional[dtime]:
     except Exception:
         return None
 
-
 def chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i + n] for i in range(0, len(lst), n)]
-
 
 # ---------------- ОТПРАВКА ОПРОСОВ ----------------
 async def send_tasks_poll(
@@ -83,7 +74,6 @@ async def send_tasks_poll(
 
     groups = chunk(tasks, 10)
     today = datetime.now(tzinfo()).strftime("%d.%m.%Y")
-
     for idx, group in enumerate(groups, start=1):
         q = f"Ежедневные задачи — {today}"
         if len(groups) > 1:
@@ -96,7 +86,6 @@ async def send_tasks_poll(
             allows_multiple_answers=True,
             message_thread_id=thread_id
         )
-
 
 # ---------------- ПЛАНИРОВЩИК ----------------
 def reschedule_daily_job(app: Application) -> None:
@@ -113,7 +102,7 @@ def reschedule_daily_job(app: Application) -> None:
         return
 
     th_id = STATE.get("thread_id")
-    # В PTB 21.7 timezone задаётся через tz-aware time; параметра timezone= НЕТ
+    # В PTB 21.7 передаём tz-aware time, параметра timezone= нет
     app.job_queue.run_daily(
         callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
         time=send_time,
@@ -121,8 +110,20 @@ def reschedule_daily_job(app: Application) -> None:
     )
     log.info(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tz})")
 
-
 # ---------------- КОМАНДЫ ----------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Команды:\n"
+        "/bind — привязать текущий чат/топик\n"
+        "/addtask Текст — добавить задачу\n"
+        "/listtasks — показать задачи\n"
+        "/deltask N — удалить задачу по номеру\n"
+        "/cleartasks — очистить все задачи\n"
+        "/settime HH:MM — время ежедневной отправки\n"
+        "/postnow — отправить опрос сейчас\n"
+        "/whereami — показать chat_id и thread_id"
+    )
+
 async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
@@ -138,12 +139,10 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     log.info("/bind ok: chat_id=%s thread_id=%s", STATE['chat_id'], STATE['thread_id'])
 
-
 async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
     await msg.reply_text(f"chat_id = {update.effective_chat.id}\nthread_id = {thread_id}")
-
 
 async def addtask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args).strip()
@@ -154,7 +153,6 @@ async def addtask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     save_state(STATE)
     await update.effective_message.reply_text(f"Добавил: «{text}». Всего задач: {len(STATE['tasks'])}")
 
-
 async def listtasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tasks: List[str] = STATE.get("tasks", [])
     if not tasks:
@@ -162,7 +160,6 @@ async def listtasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     lines = "\n".join(f"{i+1}. {t}" for i, t in enumerate(tasks))
     await update.effective_message.reply_text(lines)
-
 
 async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -182,14 +179,11 @@ async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         await update.effective_message.reply_text("Нет задачи с таким номером.")
 
-
 async def cleartasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Полное очищение списка задач
     STATE["tasks"] = []
     save_state(STATE)
     await update.effective_message.reply_text("Готово: список задач очищен.")
     log.info("/cleartasks ok")
-
 
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -204,7 +198,6 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     reschedule_daily_job(context.application)
     await update.effective_message.reply_text(f"Ок, буду слать каждый день в {STATE['send_time']}.")
 
-
 async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     c_id = STATE.get("chat_id")
     th_id = STATE.get("thread_id")
@@ -214,35 +207,9 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_tasks_poll(context, chat_id=c_id, thread_id=th_id)
     await update.effective_message.reply_text("Отправил задачи как опрос.")
 
-
-# ---------------- ФОЛЛБЭК ТОЛЬКО ДЛЯ НЕИЗВЕСТНЫХ КОМАНД ----------------
-KNOWN_CMDS = {
-    "bind", "whereami", "addtask", "listtasks", "deltask",
-    "cleartasks", "settime", "postnow"
-}
-
-def is_unknown_command(text: Optional[str]) -> bool:
-    if not text or not text.startswith("/"):
-        return False
-    # Берём первую "словную" часть без аргументов, слэшей и @бота
-    cmd = text.split()[0]          # "/cleartasks@BotName"
-    cmd = cmd.split("@")[0]        # "/cleartasks"
-    cmd = cmd.lstrip("/")          # "cleartasks"
-    return cmd.lower() not in KNOWN_CMDS
-
-
-async def unknown_command_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text or ""
-    # если это известная команда — молча игнор (её обработает соответствующий хэндлер)
-    if not is_unknown_command(text):
-        return
-    await update.effective_message.reply_text(f"Команда получена: {text}")
-
-
-# ---------------- ОШИБКИ ----------------
+# ---------------- ОБРАБОТЧИК ОШИБОК ----------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error: %s", context.error)
-
 
 # ---------------- MAIN ----------------
 def main():
@@ -256,24 +223,25 @@ def main():
 
     app: Application = ApplicationBuilder().token(token).build()
 
-    # Команды (регистрируем раньше всего)
-    app.add_handler(CommandHandler(["bind"], bind_cmd))
-    app.add_handler(CommandHandler(["whereami"], whereami_cmd))
-    app.add_handler(CommandHandler(["addtask"], addtask_cmd))
-    app.add_handler(CommandHandler(["listtasks"], listtasks_cmd))
-    app.add_handler(CommandHandler(["deltask"], deltask_cmd))
+    # Команды
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("bind", bind_cmd))
+    app.add_handler(CommandHandler("whereami", whereami_cmd))
+    app.add_handler(CommandHandler("addtask", addtask_cmd))
+    app.add_handler(CommandHandler("listtasks", listtasks_cmd))
+    app.add_handler(CommandHandler("deltask", deltask_cmd))
     app.add_handler(CommandHandler(["cleartasks", "clear", "clear_tasks"], cleartasks_cmd))
-    app.add_handler(CommandHandler(["settime"], settime_cmd))
-    app.add_handler(CommandHandler(["postnow"], postnow_cmd))
+    app.add_handler(CommandHandler("settime", settime_cmd))
+    app.add_handler(CommandHandler("postnow", postnow_cmd))
 
-    # Фоллбэк: только для неизвестных /команд.
-    # Ставим в другую группу (group=1), чтобы не перебивать известные хэндлеры.
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command_echo), group=1)
+    # Доп. страховка для /cleartasks на любых апдейтах (каналы/топики и т.п.)
+    clear_regex = r"^/(?:cleartasks|clear|clear_tasks)(?:@\w+)?(?:\s|$)"
+    app.add_handler(MessageHandler(filters.Regex(clear_regex), cleartasks_cmd), group=0)
 
-    # Глобальный обработчик ошибок
+    # Больше НЕТ фоллбэка «Команда получена: ...», чтобы он не мешал.
     app.add_error_handler(on_error)
 
-    # Запланировать ежедневную отправку, если chat_id/время уже сохранены
+    # Планировщик
     reschedule_daily_job(app)
 
     log.info("Стартую webhook на порту %s | webhook=%s/%s", port, base_url, token)
@@ -283,7 +251,6 @@ def main():
         webhook_url=f"{base_url}/{token}",
         allowed_updates=Update.ALL_TYPES,
     )
-
 
 if __name__ == "__main__":
     try:
