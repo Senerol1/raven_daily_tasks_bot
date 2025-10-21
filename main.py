@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, time as dtime
 from typing import Dict, Any, List, Optional
 
+import aiohttp
 from aiohttp import web
 from pytz import timezone
 from tzlocal import get_localzone
@@ -17,7 +18,7 @@ from telegram.ext import (
 
 STATE_PATH = "state.json"
 
-# ---------- Хранилище ----------
+# ---------- Состояние ----------
 def load_state() -> Dict[str, Any]:
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
@@ -28,8 +29,8 @@ def load_state() -> Dict[str, Any]:
     return {
         "chat_id": None,
         "thread_id": None,
-        "send_time": "09:00",    # HH:MM локальное время сервера
-        "tasks": []              # список строк
+        "send_time": "09:00",
+        "tasks": []
     }
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -57,7 +58,7 @@ def parse_time_str(hhmm: str) -> Optional[dtime]:
 def chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-# ---------- Отправка задач как POLL ----------
+# ---------- Отправка задач Poll'ами ----------
 async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, thread_id: Optional[int]) -> None:
     tasks: List[str] = STATE.get("tasks", [])
     if not tasks:
@@ -183,7 +184,7 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_tasks_poll(context, chat_id=c_id, thread_id=th_id)
     await update.effective_message.reply_text("Отправил задачи как опрос.")
 
-# ---------- Webhook ----------
+# ---------- Webhook + Keepalive ----------
 async def health(_request):
     return web.Response(text="ok")
 
@@ -191,17 +192,36 @@ def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
     aio = web.Application()
 
     async def handle_update(request: web.Request):
-        data = await request.json()
+        # Быстрый 200 OK и обработка в фоне — чтобы Telegram не упирался в таймаут
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(text="bad json", status=400)
+
         update = Update.de_json(data, ptb_app.bot)
-        # ВАЖНО: к этому моменту application уже initialize+start
-        await ptb_app.process_update(update)
-        return web.Response(text="ok")
+        asyncio.create_task(ptb_app.process_update(update))  # фоново
+        return web.Response(text="ok")  # мгновенный ответ
 
     aio.add_routes([
         web.get("/", health),
         web.post(f"/{token}", handle_update),
     ])
     return aio
+
+async def keepalive_task(base_url: str, stop_event: asyncio.Event):
+    # Пингуем внешний URL, чтобы Render free не усыплял инстанс
+    # 540с ≈ 9 минут; если вдруг упадёт — просто продолжаем
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while not stop_event.is_set():
+            try:
+                await session.get(base_url + "/")
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=540)
+            except asyncio.TimeoutError:
+                continue
 
 # ---------- main ----------
 async def main():
@@ -210,7 +230,7 @@ async def main():
     if not token or not base_url:
         raise RuntimeError("Нужны переменные окружения TELEGRAM_TOKEN и BASE_URL")
 
-    base_url = base_url.rstrip("/")  # на всякий случай
+    base_url = base_url.rstrip("/")
     port = int(os.getenv("PORT", "10000"))
 
     application: Application = ApplicationBuilder().token(token).build()
@@ -224,20 +244,20 @@ async def main():
     application.add_handler(CommandHandler("settime", settime_cmd))
     application.add_handler(CommandHandler("postnow", postnow_cmd))
 
-    # Планировщик (расписание привяжется после старта job_queue, но зададим сразу)
+    # Планировщик настроим (привяжется после старта job_queue)
     reschedule_daily_job(application)
 
-    # --- Правильный порядок запуска PTB ---
+    # PTB: initialize -> start
     await application.initialize()
     await application.start()
 
-    # Ставим вебхук после старта
+    # Ставим вебхук
     await application.bot.set_webhook(
         url=f"{base_url}/{token}",
         allowed_updates=Update.ALL_TYPES
     )
 
-    # Поднимаем aiohttp и начинаем принимать апдейты
+    # Поднимаем aiohttp
     web_app = make_aiohttp_app(application, token)
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -245,17 +265,26 @@ async def main():
     await site.start()
     print(f"✅ Webhook сервер запущен: {base_url}/{token}")
 
+    # Keep-alive
+    stop_evt = asyncio.Event()
+    ka_task = asyncio.create_task(keepalive_task(base_url, stop_evt))
+
     # Держим процесс живым
     try:
         await asyncio.Event().wait()
     finally:
-        # Аккуратное сворачивание
+        stop_evt.set()
+        with contextlib.suppress(Exception):
+            await ka_task
         try:
             await application.bot.delete_webhook()
         except Exception:
             pass
         await application.stop()
         await application.shutdown()
+
+# Нужен для contextlib.suppress
+import contextlib
 
 if __name__ == "__main__":
     asyncio.run(main())
