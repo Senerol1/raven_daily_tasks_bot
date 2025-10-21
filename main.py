@@ -102,10 +102,9 @@ def reschedule_daily_job(app: Application) -> None:
         return
 
     th_id = STATE.get("thread_id")
-    # В PTB 21.7 передаём tz-aware time, параметра timezone= нет
     app.job_queue.run_daily(
         callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
-        time=send_time,
+        time=send_time,  # tz-aware time; параметра timezone в PTB 21.7 нет
         name="daily_tasks_poll",
     )
     log.info(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tz})")
@@ -180,10 +179,26 @@ async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text("Нет задачи с таким номером.")
 
 async def cleartasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Логируем максимум информации, чтобы в логах точно было видно вызов
+    src = (
+        "channel_post" if update.channel_post else
+        "edited_channel_post" if update.edited_channel_post else
+        "message"
+    )
+    m = update.effective_message
+    txt = (m.text or m.caption or "").strip() if m else ""
+    log.info("/cleartasks trigger: source=%s chat_id=%s thread_id=%s text=%r",
+             src, update.effective_chat.id if update.effective_chat else None,
+             getattr(m, "message_thread_id", None), txt)
+
     STATE["tasks"] = []
     save_state(STATE)
-    await update.effective_message.reply_text("Готово: список задач очищен.")
-    log.info("/cleartasks ok")
+    if m:
+        await m.reply_text("Готово: список задач очищен.")
+    else:
+        # на всякий случай
+        await context.bot.send_message(chat_id=STATE.get("chat_id"), text="Готово: список задач очищен.")
+    log.info("/cleartasks ok (tasks=%d)", len(STATE["tasks"]))
 
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -223,7 +238,7 @@ def main():
 
     app: Application = ApplicationBuilder().token(token).build()
 
-    # Команды
+    # === Основные командные хэндлеры ===
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("bind", bind_cmd))
     app.add_handler(CommandHandler("whereami", whereami_cmd))
@@ -234,11 +249,33 @@ def main():
     app.add_handler(CommandHandler("settime", settime_cmd))
     app.add_handler(CommandHandler("postnow", postnow_cmd))
 
-    # Доп. страховка для /cleartasks на любых апдейтах (каналы/топики и т.п.)
+    # === Железная страховка для /cleartasks на всех апдейтах ===
     clear_regex = r"^/(?:cleartasks|clear|clear_tasks)(?:@\w+)?(?:\s|$)"
-    app.add_handler(MessageHandler(filters.Regex(clear_regex), cleartasks_cmd), group=0)
 
-    # Больше НЕТ фоллбэка «Команда получена: ...», чтобы он не мешал.
+    # 1) Обычные сообщения (личка/группы/топики)
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(clear_regex), cleartasks_cmd), group=0)
+    app.add_handler(MessageHandler(filters.COMMAND & filters.Regex(clear_regex), cleartasks_cmd), group=0)
+
+    # 2) Каналы (channel_post)
+    app.add_handler(
+        MessageHandler(filters.UpdateType.CHANNEL_POST & (filters.TEXT | filters.Caption()) & filters.Regex(clear_regex),
+                       cleartasks_cmd),
+        group=0
+    )
+    # 3) Отредактированные посты в каналах
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST & (filters.TEXT | filters.Caption()) & filters.Regex(clear_regex),
+                       cleartasks_cmd),
+        group=0
+    )
+    # 4) Отредактированные обычные сообщения (на всякий случай)
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE & (filters.TEXT) & filters.Regex(clear_regex),
+                       cleartasks_cmd),
+        group=0
+    )
+
+    # Ошибки
     app.add_error_handler(on_error)
 
     # Планировщик
