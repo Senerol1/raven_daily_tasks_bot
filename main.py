@@ -45,7 +45,7 @@ STATE = load_state()
 
 
 def tzinfo():
-    # Возвращаем локальный часовой пояс (ZoneInfo). Фоллбэк — UTC.
+    # Локальный TZ; фоллбэк — UTC
     try:
         return get_localzone()
     except Exception:
@@ -113,7 +113,7 @@ def reschedule_daily_job(app: Application) -> None:
         return
 
     th_id = STATE.get("thread_id")
-    # В PTB 21.7 timezone передаётся через tz-aware time; параметра timezone нет
+    # В PTB 21.7 timezone задаётся через tz-aware time; параметра timezone= НЕТ
     app.job_queue.run_daily(
         callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
         time=send_time,
