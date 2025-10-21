@@ -1,16 +1,13 @@
 # main.py
 import os
-import json
 import asyncio
 import logging
-import contextlib
+import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime, time as dtime
 
-import aiohttp
-from aiohttp import web
-from pytz import timezone
 from tzlocal import get_localzone
+from pytz import timezone as tz_by_name
 
 from telegram import Update
 from telegram.ext import (
@@ -18,7 +15,7 @@ from telegram.ext import (
     CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# ---------- Логирование ----------
+# ---------- Логи ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -49,7 +46,7 @@ def tzinfo():
     try:
         return get_localzone()
     except Exception:
-        return timezone("UTC")
+        return tz_by_name("UTC")
 
 # ---------- Утилиты ----------
 def parse_time_str(hhmm: str, tz) -> Optional[dtime]:
@@ -73,17 +70,16 @@ async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, t
         )
         return
 
-    groups = chunk(tasks, 10)  # Telegram: максимум 10 опций в Poll
+    groups = chunk(tasks, 10)
     today = datetime.now(tzinfo()).strftime("%d.%m.%Y")
 
     for idx, group in enumerate(groups, start=1):
-        question = f"Ежедневные задачи — {today}"
+        q = f"Ежедневные задачи — {today}"
         if len(groups) > 1:
-            question += f" ({idx}/{len(groups)})"
-
+            q += f" ({idx}/{len(groups)})"
         await context.bot.send_poll(
             chat_id=chat_id,
-            question=question,
+            question=q,
             options=group,
             is_anonymous=False,
             allows_multiple_answers=True,
@@ -107,7 +103,7 @@ def reschedule_daily_job(app: Application) -> None:
     th_id = STATE.get("thread_id")
     app.job_queue.run_daily(
         callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
-        time=send_time,   # tz-aware время
+        time=send_time,
         name="daily_tasks_poll",
     )
     log.info(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tz})")
@@ -121,9 +117,11 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     STATE["chat_id"] = chat.id
     STATE["thread_id"] = thread_id
     save_state(STATE)
-
     reschedule_daily_job(context.application)
-    await msg.reply_text(f"Привязано!\nchat_id = {STATE['chat_id']}\nthread_id = {STATE['thread_id']}")
+
+    await msg.reply_text(
+        f"Привязано!\nchat_id = {STATE['chat_id']}\nthread_id = {STATE['thread_id']}"
+    )
 
 async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -165,6 +163,11 @@ async def deltask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         await update.effective_message.reply_text("Нет задачи с таким номером.")
 
+async def cleartasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    STATE["tasks"] = []
+    save_state(STATE)
+    await update.effective_message.reply_text("Готово: список задач очищен.")
+
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.effective_message.reply_text("Использование: /settime HH:MM (локальное время сервера)")
@@ -195,46 +198,6 @@ async def any_command_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled error: %s", context.error)
 
-# ---------- Webhook + Keepalive ----------
-async def health(_request):
-    return web.Response(text="ok")
-
-def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
-    aio = web.Application()
-
-    async def handle_update(request: web.Request):
-        try:
-            data = await request.json()
-        except Exception:
-            return web.Response(text="bad json", status=400)
-
-        try:
-            update = Update.de_json(data, ptb_app.bot)
-            ptb_app.update_queue.put_nowait(update)
-        except Exception as e:
-            log.exception("Ошибка помещения апдейта в очередь: %s", e)
-
-        return web.Response(text="ok")
-
-    aio.add_routes([
-        web.get("/", health),
-        web.post(f"/{token}", handle_update),
-    ])
-    return aio
-
-async def keepalive_task(base_url: str, stop_event: asyncio.Event):
-    timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while not stop_event.is_set():
-            try:
-                await session.get(base_url + "/")
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=540)
-            except asyncio.TimeoutError:
-                continue
-
 # ---------- main ----------
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
@@ -245,50 +208,34 @@ async def main():
     base_url = base_url.rstrip("/")
     port = int(os.getenv("PORT", "10000"))
 
-    application: Application = ApplicationBuilder().token(token).build()
+    app: Application = ApplicationBuilder().token(token).build()
 
     # Команды
-    application.add_handler(CommandHandler("bind", bind_cmd))
-    application.add_handler(CommandHandler("whereami", whereami_cmd))
-    application.add_handler(CommandHandler("addtask", addtask_cmd))
-    application.add_handler(CommandHandler("listtasks", listtasks_cmd))
-    application.add_handler(CommandHandler("deltask", deltask_cmd))
-    application.add_handler(CommandHandler("settime", settime_cmd))
-    application.add_handler(CommandHandler("postnow", postnow_cmd))
-    application.add_handler(MessageHandler(filters.COMMAND & ~filters.UpdateType.EDITED, any_command_echo))
-    application.add_error_handler(on_error)
+    app.add_handler(CommandHandler("bind", bind_cmd))
+    app.add_handler(CommandHandler("whereami", whereami_cmd))
+    app.add_handler(CommandHandler("addtask", addtask_cmd))
+    app.add_handler(CommandHandler("listtasks", listtasks_cmd))
+    app.add_handler(CommandHandler("deltask", deltask_cmd))
+    app.add_handler(CommandHandler("cleartasks", cleartasks_cmd))
+    app.add_handler(CommandHandler("settime", settime_cmd))
+    app.add_handler(CommandHandler("postnow", postnow_cmd))
+    app.add_handler(MessageHandler(filters.COMMAND, any_command_echo))
+    app.add_error_handler(on_error)
 
-    # Планировщик
-    reschedule_daily_job(application)
+    reschedule_daily_job(app)
 
-    await application.initialize()
-    await application.start()
-
-    await application.bot.set_webhook(
-        url=f"{base_url}/{token}",
+    log.info("Запуск run_webhook на порту %s | webhook=%s/%s", port, base_url, token)
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=f"{base_url}/{token}",
         allowed_updates=Update.ALL_TYPES
     )
 
-    web_app = make_aiohttp_app(application, token)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info("✅ Webhook сервер запущен: %s/%s", base_url, token)
-
-    stop_evt = asyncio.Event()
-    ka_task = asyncio.create_task(keepalive_task(base_url, stop_evt))
-
-    try:
-        await asyncio.Event().wait()
-    finally:
-        stop_evt.set()
-        with contextlib.suppress(Exception):
-            await ka_task
-        with contextlib.suppress(Exception):
-            await application.bot.delete_webhook()
-        await application.stop()
-        await application.shutdown()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception:
+        logging.exception("Fatal error on startup")
