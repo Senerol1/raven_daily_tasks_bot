@@ -52,10 +52,10 @@ def tzinfo():
         return timezone("UTC")
 
 # ---------- Утилиты ----------
-def parse_time_str(hhmm: str) -> Optional[dtime]:
+def parse_time_str(hhmm: str, tz) -> Optional[dtime]:
     try:
         hh, mm = hhmm.strip().split(":")
-        return dtime(hour=int(hh), minute=int(mm), second=0)
+        return dtime(hour=int(hh), minute=int(mm), second=0, tzinfo=tz)
     except Exception:
         return None
 
@@ -97,7 +97,8 @@ def reschedule_daily_job(app: Application) -> None:
     except Exception:
         pass
 
-    send_time = parse_time_str(str(STATE.get("send_time", "09:00")))
+    tz = tzinfo()
+    send_time = parse_time_str(str(STATE.get("send_time", "09:00")), tz)
     c_id = STATE.get("chat_id")
     if not (send_time and c_id):
         log.info("[reschedule] пропуск: нет chat_id или времени")
@@ -106,11 +107,10 @@ def reschedule_daily_job(app: Application) -> None:
     th_id = STATE.get("thread_id")
     app.job_queue.run_daily(
         callback=lambda ctx: send_tasks_poll(ctx, chat_id=c_id, thread_id=th_id),
-        time=send_time,
+        time=send_time,   # tz-aware время
         name="daily_tasks_poll",
-        timezone=tzinfo()
     )
-    log.info(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tzinfo()})")
+    log.info(f"[reschedule] ежедневная отправка в {STATE['send_time']} (TZ={tz})")
 
 # ---------- Команды ----------
 async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -123,7 +123,6 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_state(STATE)
 
     reschedule_daily_job(context.application)
-
     await msg.reply_text(f"Привязано!\nchat_id = {STATE['chat_id']}\nthread_id = {STATE['thread_id']}")
 
 async def whereami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,7 +169,7 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not context.args:
         await update.effective_message.reply_text("Использование: /settime HH:MM (локальное время сервера)")
         return
-    t = parse_time_str(context.args[0])
+    t = parse_time_str(context.args[0], tzinfo())
     if not t:
         await update.effective_message.reply_text("Неверный формат. Пример: /settime 10:30")
         return
@@ -188,10 +187,13 @@ async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_tasks_poll(context, chat_id=c_id, thread_id=th_id)
     await update.effective_message.reply_text("Отправил задачи как опрос.")
 
-# Ловим любые команды на всякий случай — для диагностики
 async def any_command_echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cmd = update.effective_message.text or ""
     await update.effective_message.reply_text(f"Команда получена: {cmd}")
+
+# ---------- Ошибки ----------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error: %s", context.error)
 
 # ---------- Webhook + Keepalive ----------
 async def health(_request):
@@ -201,7 +203,6 @@ def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
     aio = web.Application()
 
     async def handle_update(request: web.Request):
-        # Быстрый 200 OK, апдейт отдаём в очередь PTB (надёжнее, чем прямой process_update)
         try:
             data = await request.json()
         except Exception:
@@ -230,7 +231,7 @@ async def keepalive_task(base_url: str, stop_event: asyncio.Event):
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=540)  # ~9 минут
+                await asyncio.wait_for(stop_event.wait(), timeout=540)
             except asyncio.TimeoutError:
                 continue
 
@@ -254,23 +255,20 @@ async def main():
     application.add_handler(CommandHandler("deltask", deltask_cmd))
     application.add_handler(CommandHandler("settime", settime_cmd))
     application.add_handler(CommandHandler("postnow", postnow_cmd))
-    # Диагностика: если какая-то неизвестная команда — ответим, чтобы видеть, что вообще ловим
     application.add_handler(MessageHandler(filters.COMMAND & ~filters.UpdateType.EDITED, any_command_echo))
+    application.add_error_handler(on_error)
 
     # Планировщик
     reschedule_daily_job(application)
 
-    # PTB: initialize -> start
     await application.initialize()
     await application.start()
 
-    # Ставим вебхук (включаем все апдейты — вдруг в меню тыкнешь кнопки)
     await application.bot.set_webhook(
         url=f"{base_url}/{token}",
         allowed_updates=Update.ALL_TYPES
     )
 
-    # aiohttp сервер
     web_app = make_aiohttp_app(application, token)
     runner = web.AppRunner(web_app)
     await runner.setup()
@@ -278,7 +276,6 @@ async def main():
     await site.start()
     log.info("✅ Webhook сервер запущен: %s/%s", base_url, token)
 
-    # keep-alive
     stop_evt = asyncio.Event()
     ka_task = asyncio.create_task(keepalive_task(base_url, stop_evt))
 
