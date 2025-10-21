@@ -41,7 +41,6 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 def tzinfo():
-    # таймзона сервера (на Render — обычно UTC)
     try:
         return get_localzone()
     except Exception:
@@ -69,8 +68,7 @@ async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, t
         )
         return
 
-    # Telegram ограничивает poll максимум 10 опциями
-    groups = chunk(tasks, 10)
+    groups = chunk(tasks, 10)  # в одном Poll не более 10 опций
     today = datetime.now(tzinfo()).strftime("%d.%m.%Y")
 
     for idx, group in enumerate(groups, start=1):
@@ -89,7 +87,11 @@ async def send_tasks_poll(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, t
 
 # ---------- Планировщик ----------
 def reschedule_daily_job(app: Application) -> None:
-    app.job_queue.scheduler.remove_all_jobs()
+    try:
+        app.job_queue.scheduler.remove_all_jobs()
+    except Exception:
+        pass
+
     send_time = parse_time_str(str(STATE.get("send_time", "09:00")))
     c_id = STATE.get("chat_id")
     if not (send_time and c_id):
@@ -113,7 +115,6 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     STATE["thread_id"] = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
     save_state(STATE)
 
-    # после привязки — пересоздаём расписание
     reschedule_daily_job(context.application)
 
     await msg.reply_text(
@@ -192,6 +193,7 @@ def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
     async def handle_update(request: web.Request):
         data = await request.json()
         update = Update.de_json(data, ptb_app.bot)
+        # ВАЖНО: к этому моменту application уже initialize+start
         await ptb_app.process_update(update)
         return web.Response(text="ok")
 
@@ -204,13 +206,16 @@ def make_aiohttp_app(ptb_app: Application, token: str) -> web.Application:
 # ---------- main ----------
 async def main():
     token = os.getenv("TELEGRAM_TOKEN")
-    base_url = os.getenv("BASE_URL")  # вида https://raven-daily-tasks-bot.onrender.com  (без / на конце)
+    base_url = os.getenv("BASE_URL", "")
     if not token or not base_url:
         raise RuntimeError("Нужны переменные окружения TELEGRAM_TOKEN и BASE_URL")
 
+    base_url = base_url.rstrip("/")  # на всякий случай
+    port = int(os.getenv("PORT", "10000"))
+
     application: Application = ApplicationBuilder().token(token).build()
 
-    # Хендлеры
+    # Команды
     application.add_handler(CommandHandler("bind", bind_cmd))
     application.add_handler(CommandHandler("whereami", whereami_cmd))
     application.add_handler(CommandHandler("addtask", addtask_cmd))
@@ -219,24 +224,38 @@ async def main():
     application.add_handler(CommandHandler("settime", settime_cmd))
     application.add_handler(CommandHandler("postnow", postnow_cmd))
 
-    # Планировщик
+    # Планировщик (расписание привяжется после старта job_queue, но зададим сразу)
     reschedule_daily_job(application)
 
-    # Вебхук
+    # --- Правильный порядок запуска PTB ---
+    await application.initialize()
+    await application.start()
+
+    # Ставим вебхук после старта
     await application.bot.set_webhook(
         url=f"{base_url}/{token}",
         allowed_updates=Update.ALL_TYPES
     )
 
+    # Поднимаем aiohttp и начинаем принимать апдейты
     web_app = make_aiohttp_app(application, token)
     runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"✅ Webhook сервер запущен: {base_url}/{token}")
 
-    # держим процесс живым
-    await asyncio.Event().wait()
+    # Держим процесс живым
+    try:
+        await asyncio.Event().wait()
+    finally:
+        # Аккуратное сворачивание
+        try:
+            await application.bot.delete_webhook()
+        except Exception:
+            pass
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
